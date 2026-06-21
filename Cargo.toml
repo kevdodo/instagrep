@@ -1,0 +1,12 @@
+[package]
+name = "instagrep"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Fast grep-style search using a persisted trigram index"
+
+[dependencies]
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"
