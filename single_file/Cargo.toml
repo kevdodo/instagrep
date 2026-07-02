@@ -1,0 +1,10 @@
+[package]
+name = "fast_log_indexer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+memmap2 = "0.9"
+rayon = "1.10"
+dashmap = "6.0" # Fast concurrent hashmap to avoid global lock contention
+fxhash = "0.2"  # Much faster hashing algorithm than standard SipHash for safe/trusted keys
