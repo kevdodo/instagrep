@@ -2,162 +2,251 @@ use dashmap::DashMap;
 use fxhash::FxBuildHasher;
 use memmap2::Mmap;
 use rayon::prelude::*;
+use roaring::RoaringBitmap;
 use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
 use std::sync::Arc;
 
-// Type alias for our shared, highly concurrent inverted index.
-// Maps a unique token (String) to a list of file byte offsets where it occurs.
-type InvertedIndex = Arc<DashMap<String, Vec<u64>, FxBuildHasher>>;
+// [u8; 3] keys eliminate character decoding overhead entirely.
+// RoaringBitmap compresses identical or dense line IDs down to minimal bit ranges.
+type CompressedTrigramIndex = Arc<DashMap<[u8; 3], RoaringBitmap, FxBuildHasher>>;
 
-/// Splits a huge file into roughly equal byte chunks, ensuring boundaries fall exactly on newlines.
-fn calculate_chunk_boundaries(mmap: &Mmap, num_chunks: usize) -> Vec<(usize, usize)> {
+/// PASS 1: Scans the raw memory map in parallel to harvest the starting byte position of every line.
+fn collect_line_offsets(mmap: &Mmap) -> Vec<u64> {
     let file_size = mmap.len();
     if file_size == 0 { return vec![]; }
-    
-    let chunk_size = file_size / num_chunks;
-    let mut boundaries = Vec::new();
-    let mut start = 0;
 
-    for i in 1..num_chunks {
+    let num_cores = rayon::current_num_threads();
+    let chunk_size = file_size / num_cores;
+    
+    let mut byte_chunks = Vec::new();
+    let mut start = 0;
+    for i in 1..num_cores {
         let mut end = i * chunk_size;
-        // Scan forward to find the next newline so we don't slice a log line in half
-        while end < file_size && mmap[end] != b'\n' {
-            end += 1;
-        }
-        if end < file_size {
-            end += 1; // Include the newline in the current chunk
-        }
-        if start < file_size {
-            boundaries.push((start, std::cmp::min(end, file_size)));
-        }
+        while end < file_size && mmap[end] != b'\n' { end += 1; }
+        if end < file_size { end += 1; }
+        byte_chunks.push((start, end));
         start = end;
     }
-    
-    if start < file_size {
-        boundaries.push((start, file_size));
+    if start < file_size { byte_chunks.push((start, file_size)); }
+
+    byte_chunks.into_par_iter().flat_map(|(start, end)| {
+        let mut local_offsets = Vec::new();
+        let mut pos = start;
+        if pos < end {
+            local_offsets.push(pos as u64); 
+        }
+        while pos < end {
+            if mmap[pos] == b'\n' && pos + 1 < end {
+                local_offsets.push((pos + 1) as u64);
+            }
+            pos += 1;
+        }
+        local_offsets
+    }).collect()
+}
+
+/// Zero-allocation sliding window over a raw line slice.
+#[inline(always)]
+fn extract_trigrams_bytes(line_bytes: &[u8], mut feed_trigram: impl FnMut([u8; 3])) {
+    if line_bytes.len() < 3 { return; }
+    for window in line_bytes.windows(3) {
+        feed_trigram([window[0], window[1], window[2]]);
     }
-    boundaries
 }
 
-/// Tokenizes a raw byte slice into alphanumeric words.
-/// Zero allocations during tokenization by working directly with primitive byte slices.
-fn tokenize<'a>(bytes: &'a [u8]) -> Vec<&'a str> {
-    std::str::from_utf8(bytes)
-        .unwrap_or("")
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-/// Linearly scans a single log line starting at `line_offset` and updates the thread-local map.
-fn process_line(line_bytes: &[u8], line_offset: u64, local_index: &mut fxhash::FxHashMap<String, Vec<u64>>) {
-    for token in tokenize(line_bytes) {
-        // Only allocate the String key if it's the first time this thread has encountered it
-        local_index
-            .entry(token.to_string())
-            .or_default()
-            .push(line_offset);
-    }
-}
-
-fn build_index(mmap: &Mmap) -> InvertedIndex {
-    let num_cores = rayon::current_num_threads();
-    let chunks = calculate_chunk_boundaries(mmap, num_cores * 4); // Oversample to keep CPU queues full
+/// PASS 2: Indexes the file by processing chunks of pre-calculated Line IDs concurrently.
+fn build_compressed_index(mmap: &Mmap, line_offsets: &[u64]) -> CompressedTrigramIndex {
+    let global_index: CompressedTrigramIndex = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
+    let total_lines = line_offsets.len();
     
-    let global_index: InvertedIndex = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
+    // Chunk size of 100k lines strikes a perfect balance for thread-local map performance
+    let chunk_size = 100_000;
+    
+    line_offsets.par_chunks(chunk_size).enumerate().for_each(|(chunk_idx, item_chunk)| {
+        let base_line_id = (chunk_idx * chunk_size) as u32;
+        let mut local_index: fxhash::FxHashMap<[u8; 3], Vec<u32>> = fxhash::FxHashMap::default();
+        let mut seen_in_line = fxhash::FxHashSet::default();
 
-    // Parallel processing pipeline using Rayon's work-stealing pool
-    chunks.into_par_iter().for_each(|(chunk_start, chunk_end)| {
-        // Thread-local hashmap entirely eliminates lock contention during tokenization
-        let mut local_index = fxhash::FxHashMap::default();
-        
-        let chunk_bytes = &mmap[chunk_start..chunk_end];
-        let mut current_pos = 0;
-
-        // Manual line scanning loop optimized for sequential memory access
-        while current_pos < chunk_bytes.len() {
-            let line_remainder = &chunk_bytes[current_pos..];
-            let next_nl = line_remainder.iter().position(|&b| b == b'\n');
+        for (local_idx, &start_offset) in item_chunk.iter().enumerate() {
+            let global_line_id = base_line_id + local_idx as u32;
             
-            let line_len = match next_nl {
-                Some(idx) => idx + 1,
-                None => line_remainder.len(),
+            let end_offset = if (global_line_id as usize) + 1 < total_lines {
+                line_offsets[(global_line_id as usize) + 1]
+            } else {
+                mmap.len() as u64
             };
 
-            let global_line_offset = (chunk_start + current_pos) as u64;
-            let line_bytes = &line_remainder[..line_len];
-            
-            process_line(line_bytes, global_line_offset, &mut local_index);
-            current_pos += line_len;
+            let line_bytes = &mmap[start_offset as usize..end_offset as usize];
+            seen_in_line.clear();
+
+            extract_trigrams_bytes(line_bytes, |trigram| {
+                if seen_in_line.insert(trigram) {
+                    local_index.entry(trigram).or_default().push(global_line_id);
+                }
+            });
         }
 
-        // Drain the thread-local index back into the shared concurrent DashMap
-        for (token, mut offsets) in local_index {
-            global_index.entry(token).or_default().append(&mut offsets);
+        // Merge local sorted batches directly into the global DashMap Roaring Bitmaps
+        for (trigram, line_ids) in local_index {
+            global_index.entry(trigram).or_default().extend(line_ids);
         }
-    });
-
-    // Sort the posting lists so intersection queries are lightning fast
-    global_index.iter_mut().for_each(|mut entry| {
-        entry.value_mut().sort_unstable();
     });
 
     global_index
 }
 
-/// Given an absolute byte offset, prints out the entire log line cleanly.
-fn print_line_at_offset(mmap: &Mmap, offset: u64) {
-    let idx = offset as usize;
-    if idx >= mmap.len() { return; }
-
-    let remainder = &mmap[idx..];
-    let line_len = remainder.iter().position(|&b| b == b'\n').unwrap_or(remainder.len());
+/// Extracts static literal byte sequences out of a regex pattern string.
+fn extract_literal_trigrams_bytes_from_regex(pattern: &str) -> Vec<[u8; 3]> {
+    let mut trigrams = Vec::new();
+    let mut current_literal = Vec::new();
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
     
-    if let Ok(line_str) = std::str::from_utf8(&remainder[..line_len]) {
-        println!("[Offset {}]: {}", offset, line_str);
+    while i < chars.len() {
+        let c = chars[i];
+        if ['\\', '.', '+', '*', '?', '(', ')', '[', ']', '{', '}', '^', '$', '|'].contains(&c) {
+            if current_literal.len() >= 3 {
+                for window in current_literal.windows(3) {
+                    trigrams.push([window[0], window[1], window[2]]);
+                }
+            }
+            current_literal.clear();
+            if c == '\\' && i + 1 < chars.len() { i += 1; } 
+        } else {
+            let mut buf = [0; 4];
+            for &b in c.encode_utf8(&mut buf).as_bytes() {
+                current_literal.push(b);
+            }
+        }
+        i += 1;
     }
+    if current_literal.len() >= 3 {
+        for window in current_literal.windows(3) {
+            trigrams.push([window[0], window[1], window[2]]);
+        }
+    }
+    trigrams
+}
+
+/// Safely extracts a raw byte slice corresponding to a specific global Line ID.
+#[inline(always)]
+fn get_line_bytes<'a>(mmap: &'a Mmap, line_offsets: &[u64], line_id: u32) -> &'a [u8] {
+    let idx = line_id as usize;
+    let start = line_offsets[idx] as usize;
+    let end = if idx + 1 < line_offsets.len() {
+        line_offsets[idx + 1] as usize
+    } else {
+        mmap.len()
+    };
+    &mmap[start..end]
 }
 
 fn main() -> io::Result<()> {
-    let file_path = "/home/kdo/instagrep/bench/data.log"; // Change this to your target file
+    let file_path = "/home/kdo/instagrep/bench/data.log"; 
     
     println!("Opening file and memory mapping...");
     let file = File::open(Path::new(file_path))?;
     let mmap = unsafe { Mmap::map(&file)? };
-    // let mmap = unsafe { 
-    //     memmap2::MmapOptions::new()
-    //         .populate() 
-    //         .map(&file)? 
-    // };
-    println!("Indexing {} file in parallel... (Sit back, this scales with your CPU cores)", file_path);
-    let start_time = std::time::Instant::now();
-    let index = build_index(&mmap);
-    println!("Index built successfully in {:?}", start_time.elapsed());
-    println!("Distinct tokens indexed: {}", index.len());
 
-    // Simple interactive query loop
+    println!("Pass 1: Identifying line boundaries...");
+    let p1_start = std::time::Instant::now();
+    let line_offsets = collect_line_offsets(&mmap);
+    println!("Found {} lines in {:?}", line_offsets.len(), p1_start.elapsed());
+
+    println!("Pass 2: Building Compressed Trigram Index...");
+    let p2_start = std::time::Instant::now();
+    let index = build_compressed_index(&mmap, &line_offsets);
+    println!("Index completed successfully in {:?}", p2_start.elapsed());
+    println!("Distinct trigrams indexed: {}", index.len());
+
     let stdin = io::stdin();
-    println!("\nEnter a search token (or 'exit' to quit):");
+    println!("\nEnter a search Regex pattern (or 'exit' to quit):");
     for line in stdin.lock().lines() {
         let query = line?;
         if query == "exit" { break; }
 
         let query_cleaned = query.trim();
         let query_start = std::time::Instant::now();
-        
-        // Sub-millisecond lookup phase
-        if let Some(offsets) = index.get(query_cleaned) {
-            println!("Found {} matches in {:?}", offsets.len(), query_start.elapsed());
-            println!("--- Showing first 5 matches ---");
-            for &offset in offsets.iter().take(5) {
-                print_line_at_offset(&mmap, offset);
+
+        // Using regex::bytes::Regex completely avoids UTF-8 string casting validation during matches
+        let regex = match regex::bytes::Regex::new(query_cleaned) {
+            Ok(re) => re,
+            Err(e) => {
+                println!("Invalid Regex syntax: {}", e);
+                continue;
+            }
+        };
+
+        let required_trigrams = extract_literal_trigrams_bytes_from_regex(query_cleaned);
+        let mut candidate_line_ids: Option<RoaringBitmap> = None;
+
+        if !required_trigrams.is_empty() {
+            for tg in required_trigrams {
+                if let Some(bitmap) = index.get(&tg) {
+                    match candidate_line_ids {
+                        None => candidate_line_ids = Some(bitmap.value().clone()),
+                        Some(ref mut current) => {
+                            // Bitwise AND intersection directly on the compressed data structures
+                            *current &= bitmap.value();
+                        }
+                    }
+                } else {
+                    // A mandatory literal trigram isn't in the index -> 0 absolute matches possible
+                    candidate_line_ids = Some(RoaringBitmap::new());
+                    break;
+                }
+            }
+        }
+
+        let mut match_count = 0;
+        let mut matches_to_show = Vec::new();
+
+        if let Some(candidates) = candidate_line_ids {
+            // High-speed evaluation: Scan only lines passed by the roaring bitmap intersection filter
+            for line_id in candidates.iter() {
+                let line_bytes = get_line_bytes(&mmap, &line_offsets, line_id);
+                if regex.is_match(line_bytes) {
+                    match_count += 1;
+                    if matches_to_show.len() < 5 {
+                        let lossy_str = String::from_utf8_lossy(line_bytes).trim_end().to_string();
+                        matches_to_show.push((line_id, lossy_str));
+                    }
+                }
             }
         } else {
-            println!("Token '{}' not found ({:?})", query_cleaned, query_start.elapsed());
+            println!("Warning: No literal trigrams found. Falling back to parallel full-file scan...");
+            // Fallback: Parallel scan over the lines array using Rayon if searching wildcards like ".*"
+            let matching_ids: Vec<u32> = line_offsets
+                .par_iter()
+                .enumerate()
+                .filter_map(|(line_id, _)| {
+                    let line_bytes = get_line_bytes(&mmap, &line_offsets, line_id as u32);
+                    if regex.is_match(line_bytes) {
+                        Some(line_id as u32)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            match_count = matching_ids.len();
+            for &line_id in matching_ids.iter().take(5) {
+                let line_bytes = get_line_bytes(&mmap, &line_offsets, line_id);
+                let lossy_str = String::from_utf8_lossy(line_bytes).trim_end().to_string();
+                matches_to_show.push((line_id, lossy_str));
+            }
         }
-        println!("\nEnter a search token:");
+
+        println!("Found {} matches in {:?}", match_count, query_start.elapsed());
+        if match_count > 0 {
+            println!("--- Showing first {} matches ---", std::cmp::min(5, match_count));
+            for (line_id, line_str) in matches_to_show {
+                println!("[Line {}]: {}", line_id, line_str);
+            }
+        }
+        println!("\nEnter a search Regex pattern:");
     }
 
     Ok(())
