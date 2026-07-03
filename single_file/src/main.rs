@@ -8,6 +8,10 @@ use std::io::{self, BufRead};
 use std::path::Path;
 use std::sync::Arc;
 
+use std::mem::size_of_val;
+
+mod index;
+
 // [u8; 3] keys eliminate character decoding overhead entirely.
 // RoaringBitmap compresses identical or dense line IDs down to minimal bit ranges.
 type CompressedTrigramIndex = Arc<DashMap<[u8; 3], RoaringBitmap, FxBuildHasher>>;
@@ -93,7 +97,11 @@ fn build_compressed_index(mmap: &Mmap, line_offsets: &[u64]) -> CompressedTrigra
             global_index.entry(trigram).or_default().extend(line_ids);
         }
     });
-
+    
+    println!("Optimizing index bitmap structures...");
+    global_index.iter_mut().for_each(|mut entry| {
+        entry.value_mut().optimize();
+    });
     global_index
 }
 
@@ -143,24 +151,47 @@ fn get_line_bytes<'a>(mmap: &'a Mmap, line_offsets: &[u64], line_id: u32) -> &'a
     &mmap[start..end]
 }
 
+fn get_or_build_cache(
+    mmap: &Mmap,
+    cache_path: &Path
+) -> io::Result<(Vec<u64>, CompressedTrigramIndex)>{
+    if cache_path.exists() {
+        println!("cache path exists using the path!");
+        let total_start = std::time::Instant::now();
+        let (offsets, idx) = index::load_index_from_cache(cache_path)?;
+        Ok((offsets, idx))
+    } else {
+        println!("Pass 1: Identifying line boundaries...");
+        let p1_start = std::time::Instant::now();
+        let line_offsets = collect_line_offsets(mmap);
+        println!("Found {} lines in {:?}", line_offsets.len(), p1_start.elapsed());
+
+        println!("Pass 2: Building Compressed Trigram Index...");
+        let p2_start = std::time::Instant::now();
+        let index = build_compressed_index(mmap, &line_offsets);
+        println!("Index completed successfully in {:?}", p2_start.elapsed());
+        
+        // Persist the built index to disk for next time
+        index::save_index_to_cache(cache_path, line_offsets.clone(), Arc::clone(&index))?;
+
+        Ok((line_offsets, index))
+    }
+}
+
 fn main() -> io::Result<()> {
     let file_path = "/home/kdo/instagrep/bench/data.log"; 
     
+    let cache_path = Path::new("/home/kdo/instagrep/bench/.index/data.log");
+
+
     println!("Opening file and memory mapping...");
     let file = File::open(Path::new(file_path))?;
     let mmap = unsafe { Mmap::map(&file)? };
 
-    println!("Pass 1: Identifying line boundaries...");
-    let p1_start = std::time::Instant::now();
-    let line_offsets = collect_line_offsets(&mmap);
-    println!("Found {} lines in {:?}", line_offsets.len(), p1_start.elapsed());
-
-    println!("Pass 2: Building Compressed Trigram Index...");
-    let p2_start = std::time::Instant::now();
-    let index = build_compressed_index(&mmap, &line_offsets);
-    println!("Index completed successfully in {:?}", p2_start.elapsed());
-    println!("Distinct trigrams indexed: {}", index.len());
-
+    let Ok((line_offsets, index)) = get_or_build_cache(&mmap, cache_path) else {
+        println!("Failed to get cache at {} and could not build", cache_path.display());
+        panic!();
+    };
     let stdin = io::stdin();
     println!("\nEnter a search Regex pattern (or 'exit' to quit):");
     for line in stdin.lock().lines() {
