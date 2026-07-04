@@ -1,224 +1,249 @@
-use std::io;
+//! Command-line interface and top-level orchestration.
+
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use clap::Parser;
+
 use crate::index;
-use crate::matcher;
+use crate::matcher::{self, SearchMode, SearchOptions};
 use crate::query::{self, CandidateSet};
+use crate::scanner::WalkOptions;
 
-const HELP: &str = "\
-instagrep
-
-Usage:
-    instagrep [OPTIONS] PATTERN [PATH]
-
-Options:
-    --build             Build/rebuild index only
-    --update            Update index
-    --no-index          Skip index, brute-force scan
-    -i, --ignore-case   Case-insensitive matching
-    --stats             Show index statistics
-    --time              Print per-phase timing to stderr
-    -h, --help          Show this help message
-
-Examples:
-    instagrep --build .
-    instagrep --update .
-    instagrep \"pattern\" .
-    instagrep -i \"todo|fixme\" src/
-    instagrep --no-index \"pattern\" .
-";
-
-#[derive(Debug, Default)]
-struct Args {
-    build: bool,
-    update: bool,
-    no_index: bool,
-    ignore_case: bool,
-    stats: bool,
-    time: bool,
-    help: bool,
+#[derive(Parser, Debug)]
+#[command(
+    name = "instagrep",
+    version,
+    about = "Fast grep-style search using a persisted roaring-bitmap trigram index"
+)]
+struct Cli {
+    /// Search pattern (regular expression)
     pattern: Option<String>,
-    path: PathBuf,
+    /// Path to search (defaults to current directory)
+    path: Option<PathBuf>,
+
+    /// Build or rebuild the index, then exit
+    #[arg(long)]
+    build: bool,
+    /// Update the index incrementally, then exit
+    #[arg(long)]
+    update: bool,
+    /// Skip the index and brute-force scan every file
+    #[arg(long = "no-index")]
+    no_index: bool,
+    /// Case-insensitive matching
+    #[arg(short = 'i', long)]
+    ignore_case: bool,
+    /// Show index statistics, then exit
+    #[arg(long)]
+    stats: bool,
+    /// Print per-phase timing to stderr
+    #[arg(long)]
+    time: bool,
+    /// Print only the path of files with at least one match
+    #[arg(short = 'l', long = "files-with-matches")]
+    files_with_matches: bool,
+    /// Print only a match count per file
+    #[arg(short = 'c', long = "count")]
+    count: bool,
+    /// Lines of context to show after each match
+    #[arg(short = 'A', long = "after-context", value_name = "N")]
+    after: Option<usize>,
+    /// Lines of context to show before each match
+    #[arg(short = 'B', long = "before-context", value_name = "N")]
+    before: Option<usize>,
+    /// Lines of context to show around each match
+    #[arg(short = 'C', long = "context", value_name = "N")]
+    context: Option<usize>,
+    /// Include/exclude files matching a glob (repeatable; `!` excludes)
+    #[arg(short = 'g', long = "glob", value_name = "GLOB")]
+    globs: Vec<String>,
+    /// Search hidden files and directories
+    #[arg(long)]
+    hidden: bool,
+    /// Do not respect .gitignore / .ignore files
+    #[arg(long = "no-ignore")]
+    no_ignore: bool,
+    /// When to colour matches [auto, always, never]
+    #[arg(long, value_name = "WHEN", default_value = "auto")]
+    color: String,
 }
 
-pub fn run(args: impl IntoIterator<Item = String>) -> io::Result<i32> {
-    let args = parse_args(args)?;
-    if args.help {
-        println!("{HELP}");
+pub fn run() -> io::Result<i32> {
+    let cli = Cli::parse();
+
+    let root = if cli.build || cli.update || cli.stats {
+        cli.path.clone().or_else(|| cli.pattern.clone().map(PathBuf::from)).unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        cli.path.clone().unwrap_or_else(|| PathBuf::from("."))
+    };
+
+    let walk_opts = WalkOptions {
+        no_ignore: cli.no_ignore,
+        hidden: cli.hidden,
+        globs: cli.globs.clone(),
+        max_file_size: crate::scanner::DEFAULT_MAX_FILE_SIZE,
+    };
+
+    if cli.build {
+        println!("Building index for {}...", root.display());
+        let index = index::build(&root, &walk_opts);
+        index::save(&index, &root)?;
+        index.print_stats(&root);
+        println!("Index saved to {}/", root.join(".instantgrep").display());
         return Ok(0);
     }
 
-    if args.build {
-        println!("Building index for {}...", args.path.display());
-        let index = index::build(&args.path);
-        index::save(&index, &args.path)?;
-        index.print_stats();
-        println!(
-            "Index saved to {}/",
-            args.path.join(".instantgrep").display()
-        );
+    if cli.update {
+        println!("Updating index for {}...", root.display());
+        let index = index::update(&root, &walk_opts)?;
+        index.print_stats(&root);
         return Ok(0);
     }
 
-    if args.update {
-        println!("Updating index for {}...", args.path.display());
-        let index = index::update(&args.path)?;
-        index.print_stats();
-        return Ok(0);
-    }
-
-    if args.stats {
-        return match index::load(&args.path)? {
+    if cli.stats {
+        return match index::load(&root)? {
             Some(index) => {
-                index.print_stats();
+                index.print_stats(&root);
                 Ok(0)
             }
             None => {
-                eprintln!(
-                    "No index found. Run: instagrep --build {}",
-                    args.path.display()
-                );
+                eprintln!("No index found. Run: instagrep --build {}", root.display());
                 Ok(1)
             }
         };
     }
 
-    let Some(pattern) = args.pattern.as_deref() else {
+    let Some(pattern) = cli.pattern.as_deref() else {
         eprintln!("Error: no pattern specified. Run: instagrep --help");
         return Ok(1);
     };
 
-    if args.no_index {
-        return search_brute_force(pattern, &args);
+    let search_opts = build_search_options(&cli);
+
+    if cli.no_index {
+        return search_brute_force(pattern, &root, &walk_opts, &search_opts, cli.ignore_case, cli.time);
     }
-    search_indexed(pattern, &args)
+    search_indexed(pattern, &root, &walk_opts, &search_opts, cli.ignore_case, cli.time)
 }
 
-fn parse_args(args: impl IntoIterator<Item = String>) -> io::Result<Args> {
-    let mut out = Args {
-        path: PathBuf::from("."),
-        ..Args::default()
-    };
-    let mut positional = Vec::new();
-
-    for arg in args {
-        match arg.as_str() {
-            "--build" => out.build = true,
-            "--update" => out.update = true,
-            "--no-index" => out.no_index = true,
-            "-i" | "--ignore-case" => out.ignore_case = true,
-            "--stats" => out.stats = true,
-            "--time" => out.time = true,
-            "-h" | "--help" => out.help = true,
-            "--stop" => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "--stop is not supported; this Rust port does not run a daemon",
-                ));
-            }
-            "--daemon" => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "--daemon is not supported in this Rust port",
-                ));
-            }
-            flag if flag.starts_with('-') => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown option: {flag}"),
-                ));
-            }
-            _ => positional.push(arg),
-        }
-    }
-
-    if out.build || out.update || out.stats {
-        out.path = positional
-            .first()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
+fn build_search_options(cli: &Cli) -> SearchOptions {
+    let context = cli.context.unwrap_or(0);
+    let before = cli.before.unwrap_or(context);
+    let after = cli.after.unwrap_or(context);
+    let mode = if cli.files_with_matches {
+        SearchMode::FilesWithMatches
+    } else if cli.count {
+        SearchMode::Count
     } else {
-        out.pattern = positional.first().cloned();
-        out.path = positional
-            .get(1)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
+        SearchMode::Normal
+    };
+    SearchOptions {
+        mode,
+        before,
+        after,
+        color: matcher::resolve_color(&cli.color),
     }
-
-    Ok(out)
 }
 
-fn search_brute_force(pattern: &str, args: &Args) -> io::Result<i32> {
-    let regex = matcher::compile_regex(pattern, args.ignore_case)?;
-    let results = matcher::brute_force(&args.path, &regex);
-    print_results(&results);
-    Ok(0)
+fn search_brute_force(
+    pattern: &str,
+    root: &Path,
+    walk_opts: &WalkOptions,
+    opts: &SearchOptions,
+    ignore_case: bool,
+    time: bool,
+) -> io::Result<i32> {
+    let regex = matcher::compile_regex(pattern, ignore_case)?;
+    let started = Instant::now();
+    let files = crate::scanner::scan(root, walk_opts);
+    let scan_us = started.elapsed().as_micros();
+
+    let started = Instant::now();
+    let results = matcher::search_files(&files, root, &regex, opts);
+    let match_us = started.elapsed().as_micros();
+
+    let printed = emit(results, root, opts)?;
+
+    if time {
+        eprintln!();
+        eprintln!("--- timing (pattern: {pattern:?}, brute-force) ---");
+        eprintln!("  scan:        {}", fmt_us(scan_us));
+        eprintln!("  regex match: {}  ({} files)", fmt_us(match_us), files.len());
+        eprintln!("  matches:     {}", printed);
+    }
+    Ok(if printed > 0 { 0 } else { 1 })
 }
 
-fn search_indexed(pattern: &str, args: &Args) -> io::Result<i32> {
-    let regex = matcher::compile_regex(pattern, args.ignore_case)?;
+fn search_indexed(
+    pattern: &str,
+    root: &Path,
+    walk_opts: &WalkOptions,
+    opts: &SearchOptions,
+    ignore_case: bool,
+    time: bool,
+) -> io::Result<i32> {
+    let regex = matcher::compile_regex(pattern, ignore_case)?;
 
-    let load_started = Instant::now();
-    let index = match index::load(&args.path)? {
+    let started = Instant::now();
+    let index = match index::load(root)? {
         Some(index) => index,
         None => {
             eprintln!("No index found, building...");
-            let index = index::build(&args.path);
-            index::save(&index, &args.path)?;
+            let index = index::build(root, walk_opts);
+            index::save(&index, root)?;
             index
         }
     };
-    let load_us = load_started.elapsed().as_micros();
+    let load_us = started.elapsed().as_micros();
 
-    let eval_started = Instant::now();
-    let query_pattern = if args.ignore_case {
+    let started = Instant::now();
+    let query_pattern = if ignore_case {
         pattern.to_lowercase()
     } else {
         pattern.to_string()
     };
-    let query = query::decompose(&query_pattern);
-    let candidate_set = query::evaluate_masked(&query, |trigram| index.lookup_with_masks(trigram));
-    let eval_us = eval_started.elapsed().as_micros();
+    let query = query::analyze(&query_pattern);
+    let candidate_set = query::evaluate(&query, |trigram| index.postings.get(&trigram).cloned());
+    let eval_us = started.elapsed().as_micros();
 
     let (candidate_files, candidate_count) = match &candidate_set {
         CandidateSet::All => (index.resolve_files(None), index.files.len()),
-        CandidateSet::Some(ids) => (index.resolve_files(Some(ids)), ids.len()),
+        CandidateSet::Some(bm) => (index.resolve_files(Some(bm)), bm.len() as usize),
     };
 
-    let match_started = Instant::now();
-    let results = matcher::match_files(&candidate_files, &regex);
-    let match_us = match_started.elapsed().as_micros();
+    let started = Instant::now();
+    let results = matcher::search_files(&candidate_files, root, &regex, opts);
+    let match_us = started.elapsed().as_micros();
 
-    print_results(&results);
+    let printed = emit(results, root, opts)?;
 
-    if args.time {
+    if time {
         let total_us = load_us + eval_us + match_us;
         eprintln!();
         eprintln!("--- timing (pattern: {pattern:?}) ---");
-        eprintln!("  index load:       {}", fmt_us(load_us));
+        eprintln!("  index load:   {}", fmt_us(load_us));
         eprintln!(
-            "  trigram eval:     {}  ({}/{} files candidates)",
+            "  trigram eval: {}  ({}/{} files candidates)",
             fmt_us(eval_us),
             candidate_count,
             index.files.len()
         );
-        eprintln!(
-            "  regex verify:     {}  ({} matches)",
-            fmt_us(match_us),
-            results.len()
-        );
-        eprintln!("  total:            {}", fmt_us(total_us));
+        eprintln!("  regex verify: {}  ({} matches)", fmt_us(match_us), printed);
+        eprintln!("  total:        {}", fmt_us(total_us));
     }
-
-    Ok(0)
+    Ok(if printed > 0 { 0 } else { 1 })
 }
 
-fn print_results(results: &[matcher::Match]) {
-    let output = matcher::format_results(results);
-    if !output.is_empty() {
-        println!("{output}");
-    }
+/// Stream results to buffered stdout; returns the number of matched lines
+/// printed (0 for `-l`, which prints paths, not lines).
+fn emit(results: Vec<matcher::FileResult>, root: &Path, opts: &SearchOptions) -> io::Result<usize> {
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    let printed = matcher::write_results(&mut out, &results, root, opts)?;
+    out.flush()?;
+    Ok(printed)
 }
 
 fn fmt_us(us: u128) -> String {
@@ -230,6 +255,3 @@ fn fmt_us(us: u128) -> String {
         format!("{:.3}s", us as f64 / 1_000_000.0)
     }
 }
-
-#[allow(dead_code)]
-fn _assert_path(_: &Path) {}

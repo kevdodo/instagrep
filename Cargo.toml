@@ -1,12 +1,23 @@
 [package]
 name = "instagrep"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
-description = "Fast grep-style search using a persisted trigram index"
+description = "Fast grep-style search using a persisted roaring-bitmap trigram index"
+repository = "https://github.com/kevdodo/instagrep"
 
 [dependencies]
 regex = "1"
+regex-syntax = "0.8"
+rayon = "1"
+roaring = "0.11"
+rustc-hash = "2"
+ignore = "0.4"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
