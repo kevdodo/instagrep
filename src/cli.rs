@@ -6,10 +6,11 @@ use std::time::Instant;
 
 use clap::Parser;
 
+use crate::daemon;
 use crate::index;
 use crate::matcher::{self, SearchMode, SearchOptions};
-use crate::query::{self, CandidateSet};
 use crate::scanner::WalkOptions;
+use crate::search;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -38,6 +39,9 @@ struct Cli {
     /// Show index statistics, then exit
     #[arg(long)]
     stats: bool,
+    /// Run as a persistent daemon (keeps the index in memory; queries via socket)
+    #[arg(long)]
+    daemon: bool,
     /// Print per-phase timing to stderr
     #[arg(long)]
     time: bool,
@@ -73,7 +77,7 @@ struct Cli {
 pub fn run() -> io::Result<i32> {
     let cli = Cli::parse();
 
-    let root = if cli.build || cli.update || cli.stats {
+    let root = if cli.build || cli.update || cli.stats || cli.daemon {
         cli.path.clone().or_else(|| cli.pattern.clone().map(PathBuf::from)).unwrap_or_else(|| PathBuf::from("."))
     } else {
         cli.path.clone().unwrap_or_else(|| PathBuf::from("."))
@@ -113,6 +117,10 @@ pub fn run() -> io::Result<i32> {
                 Ok(1)
             }
         };
+    }
+
+    if cli.daemon {
+        return daemon::serve(&root, &walk_opts);
     }
 
     let Some(pattern) = cli.pattern.as_deref() else {
@@ -184,7 +192,14 @@ fn search_indexed(
     ignore_case: bool,
     time: bool,
 ) -> io::Result<i32> {
-    let regex = matcher::compile_regex(pattern, ignore_case)?;
+    // Warm path: if a daemon is serving this root, ask it and skip the disk load.
+    if let Some((exit, out)) = daemon::try_query(root, &daemon::Request::new(pattern, ignore_case, opts))? {
+        let stdout = io::stdout();
+        let mut w = BufWriter::new(stdout.lock());
+        w.write_all(&out)?;
+        w.flush()?;
+        return Ok(exit);
+    }
 
     let started = Instant::now();
     let index = match index::load(root)? {
@@ -198,42 +213,27 @@ fn search_indexed(
     };
     let load_us = started.elapsed().as_micros();
 
-    let started = Instant::now();
-    let query_pattern = if ignore_case {
-        pattern.to_lowercase()
-    } else {
-        pattern.to_string()
-    };
-    let query = query::analyze(&query_pattern);
-    let candidate_set = query::evaluate(&query, |trigram| index.postings.get(&trigram).cloned());
-    let eval_us = started.elapsed().as_micros();
-
-    let (candidate_files, candidate_count) = match &candidate_set {
-        CandidateSet::All => (index.resolve_files(None), index.files.len()),
-        CandidateSet::Some(bm) => (index.resolve_files(Some(bm)), bm.len() as usize),
-    };
-
-    let started = Instant::now();
-    let results = matcher::search_files(&candidate_files, root, &regex, opts);
-    let match_us = started.elapsed().as_micros();
-
-    let printed = emit(results, root, opts)?;
+    let outcome = search::run_indexed_search(&index, root, pattern, ignore_case, opts)?;
+    let stdout = io::stdout();
+    let mut w = BufWriter::new(stdout.lock());
+    w.write_all(&outcome.output)?;
+    w.flush()?;
 
     if time {
-        let total_us = load_us + eval_us + match_us;
+        let total_us = load_us + outcome.eval_us + outcome.verify_us;
         eprintln!();
         eprintln!("--- timing (pattern: {pattern:?}) ---");
         eprintln!("  index load:   {}", fmt_us(load_us));
         eprintln!(
             "  trigram eval: {}  ({}/{} files candidates)",
-            fmt_us(eval_us),
-            candidate_count,
-            index.files.len()
+            fmt_us(outcome.eval_us),
+            outcome.candidate_count,
+            outcome.total_files
         );
-        eprintln!("  regex verify: {}  ({} matches)", fmt_us(match_us), printed);
+        eprintln!("  regex verify: {}", fmt_us(outcome.verify_us));
         eprintln!("  total:        {}", fmt_us(total_us));
     }
-    Ok(if printed > 0 { 0 } else { 1 })
+    Ok(outcome.exit)
 }
 
 /// Stream results to buffered stdout; returns the number of matched lines
