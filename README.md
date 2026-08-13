@@ -14,6 +14,23 @@ contains. At search time it derives the trigrams a regex *must* require, uses
 the index to prune the file set down to a handful of candidates, then verifies
 only those candidates with a byte regex.
 
+## Install
+
+```bash
+# one line (prebuilt binary, falls back to cargo install)
+curl -fsSL https://raw.githubusercontent.com/kvyaswanth/instagrep/main/install.sh | sh
+
+# or build from source with cargo
+cargo install --git https://github.com/kvyaswanth/instagrep --locked
+
+# or Homebrew (from HEAD until the first versioned release)
+brew tap kvyaswanth/instagrep
+brew install --HEAD instagrep
+```
+
+Prebuilt binaries are published for macOS (arm64/x86_64) and Linux
+(x86_64/aarch64) on each `v*` tag.
+
 ## Usage
 
 ```
