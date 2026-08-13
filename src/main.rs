@@ -1,6 +1,7 @@
 mod cli;
 mod index;
 mod matcher;
+mod mcp;
 mod query;
 mod scanner;
 mod trigram;

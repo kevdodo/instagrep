@@ -14,6 +14,7 @@ roaring = "0.11"
 rustc-hash = "2"
 ignore = "0.4"
 clap = { version = "4", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"

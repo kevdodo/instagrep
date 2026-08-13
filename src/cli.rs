@@ -71,6 +71,12 @@ struct Cli {
 }
 
 pub fn run() -> io::Result<i32> {
+    // `instagrep mcp` runs the MCP server (a coding-agent `search` tool).
+    // Intercept before clap so "mcp" isn't parsed as a search pattern.
+    if std::env::args().nth(1).as_deref() == Some("mcp") {
+        return crate::mcp::serve();
+    }
+
     let cli = Cli::parse();
 
     let root = if cli.build || cli.update || cli.stats {

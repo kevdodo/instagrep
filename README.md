@@ -12,9 +12,24 @@ cargo build --release
 instagrep indexes every text file under a root by the set of 3-byte trigrams it
 contains. At search time it derives the trigrams a regex *must* require, uses
 the index to prune the file set down to a handful of candidates, then verifies
-only those candidates with a byte regex. For literal-heavy patterns over large
-trees this is dramatically faster than a full scan — often **<10 ms** where
-ripgrep takes ~40 ms.
+only those candidates with a byte regex.
+
+## Install
+
+```bash
+# one line (prebuilt binary, falls back to cargo install)
+curl -fsSL https://raw.githubusercontent.com/kvyaswanth/instagrep/main/install.sh | sh
+
+# or build from source with cargo
+cargo install --git https://github.com/kvyaswanth/instagrep --locked
+
+# or Homebrew (from HEAD until the first versioned release)
+brew tap kvyaswanth/instagrep
+brew install --HEAD instagrep
+```
+
+Prebuilt binaries are published for macOS (arm64/x86_64) and Linux
+(x86_64/aarch64) on each `v*` tag.
 
 ## Usage
 
@@ -59,6 +74,27 @@ Examples:
 ```
 
 If no index exists when you search, instagrep builds one automatically.
+
+## Agents (MCP)
+
+`instagrep` is an MCP server, so coding agents — Claude Code, Cursor, anything
+that speaks MCP — can use it as a native `search` tool. No per-query tree
+rescan; the agent gets structured JSON back instead of scraping terminal output.
+
+```
+# run the stdio server
+instagrep mcp
+
+# wire it into Claude Code (one time)
+claude mcp add instagrep -- instagrep mcp
+```
+
+The `search` tool accepts `pattern` (regex), `path`, `ignore_case`, `before`,
+`after`, `glob`, `hidden`, `no_ignore`, `files_with_matches`, `count`, and
+`limit`, and returns JSON per match: `{ path, line, text, spans }`.
+
+The server runs **locally** as a subprocess and stays alive for the session, so
+the index loads once and stays warm — the fastest way to use instagrep.
 
 ## How it works
 
